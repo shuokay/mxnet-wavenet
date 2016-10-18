@@ -28,7 +28,6 @@ def residual_block(data=None, kernel=(1, 2), dilate=None, num_filter=16, name=No
     output_gate = mx.symbol.Activation(data=conv_gate, act_type="sigmoid", name=name+"activation")
     output = output_filter * output_gate
     out = mx.symbol.Convolution(data=output, kernel=(1, 1), num_filter=output_channel)
-    out = mx.symbol.BatchNorm(data=out, name=name+"-out_batch")
     return out+data, out
 
 class DataBatch(mx.io.DataBatch):
