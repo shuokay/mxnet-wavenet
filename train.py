@@ -12,10 +12,10 @@ def causal_layer(data=None, name="causal"):
     assert isinstance(data, mx.symbol.Symbol)
     zero = mx.symbol.Variable(name=name+"-zero")
     concat = mx.symbol.Concat(*[data, zero], dim=3, name=name+"-concat")
-    causal = mx.symbol.Convolution(data=concat, kernel=(1, 2), stride=(1, 1), num_filter=16, name=name)
+    causal = mx.symbol.Convolution(data=concat, kernel=(1, 2), stride=(1, 1), num_filter=32, name=name)
     return causal
 
-def residual_block(data=None, kernel=(1, 2), dilate=None, num_filter=16, name=None, stride=(1, 1), output_channel=None):
+def residual_block(data=None, kernel=(1, 2), dilate=None, num_filter=32, name=None, stride=(1, 1), output_channel=None):
     assert name is not None
     assert dilate is not None
     assert output_channel is not None
@@ -24,11 +24,12 @@ def residual_block(data=None, kernel=(1, 2), dilate=None, num_filter=16, name=No
     concat = mx.symbol.Concat(*[data, zero], dim=3, name=name+"-concat")
     conv_filter = mx.symbol.Convolution(data=concat, kernel=kernel, stride=stride, dilate=dilate, num_filter=num_filter, name=name+"conv-filter")
     conv_gate = mx.symbol.Convolution(data=concat, kernel=kernel, stride=stride, dilate=dilate, num_filter=num_filter, name=name+"conv-gate")
-    output_filter = mx.symbol.Activation(data=conv_filter, act_type="tanh", name=name+"activation")
-    output_gate = mx.symbol.Activation(data=conv_gate, act_type="sigmoid", name=name+"activation")
+    output_filter = mx.symbol.Activation(data=conv_filter, act_type="tanh", name=name+"act_filter")
+    output_gate = mx.symbol.Activation(data=conv_gate, act_type="sigmoid", name=name+"act_gate")
     output = output_filter * output_gate
-    out = mx.symbol.Convolution(data=output, kernel=(1, 1), num_filter=output_channel)
-    return out+data, out
+    out_dense = mx.symbol.Convolution(data=output, kernel=(1, 1), num_filter=output_channel, name=name+"out_dense")
+    out_skip = mx.symbol.Convolution(data=output, kernel=(1, 1), num_filter=output_channel, name=name+"out_skip")
+    return out_skip+data, out_dense
 
 class DataBatch(mx.io.DataBatch):
     def __init__(self, data, label):
@@ -74,18 +75,19 @@ class DataIter(mx.io.DataIter):
                 audio = audio[:self.length]
                 magnitude = 1.0*np.log(1+255*np.abs(audio))/np.log(1.0+255)
                 signal = np.sign(audio) * magnitude
-                audio = ((signal+1)/2.0*255+0.5).astype(np.int32)
+                audio = ((signal+1)/2.0*255+0.5).astype(np.int16)
                 label = shift(audio, -1, cval=0)
+                audio = audio.reshape(1, 1, self.length)
                 data_all[idx, :, :, :] = audio
                 label_all[idx, :] = label
                 idx += 1
             for k, v in shape.iteritems():
                 if "input" in k:
-                    data = mx.nd.array(data_all)
+                    data = mx.nd.array(np.array(data_all))
                 else:
                     data = mx.nd.array(np.zeros(shape=v))
                 mx_data.append(data)
-            label = mx.nd.array(np.reshape(label_all, (self.batch_size, self.length)))
+            label = mx.nd.array(np.array(label_all))
             mx_label.append(label)
             self.q.put(obj=DataBatch(mx_data, mx_label), block=True, timeout=None)
 
@@ -98,12 +100,29 @@ class DataIter(mx.io.DataIter):
         else:
             raise StopIteration
 
+class MYMAE(mx.metric.EvalMetric):
+    """Calculate Mean Absolute Error loss"""
+
+    def __init__(self):
+        super(MYMAE, self).__init__('mymae')
+
+    def update(self, labels, preds):
+
+        for label, pred in zip(labels, preds):
+            label = label.asnumpy()
+            pred = pred.asnumpy()
+
+            if len(label.shape) == 1:
+                label = label.reshape(label.shape[0], 1)
+            self.sum_metric += np.abs(label - np.argmax(pred, axis=1).reshape(label.shape)).mean()
+            self.num_inst += 1 # numpy.prod(label.shape)
+
 if __name__ == "__main__":
     head = '%(asctime)-15s %(message)s'
     logging.basicConfig(level=logging.INFO, format=head)
-    dilate = [2**i for i in range(1, 9)]
+    dilate = [2**i for i in range(1, 10)]
     shape = {}
-    params = {'length': 2**10, 'batch_size': 1, 'num_batch': 1}
+    params = {'length': 2**15, 'batch_size': 1}
     batch_size = params['batch_size']
     length = params['length']
     data = mx.symbol.Variable(name="input")
@@ -116,12 +135,16 @@ if __name__ == "__main__":
     outs = []
     for d in dilate:
         name = "residual-"+str(d)
-        output_channel = 16
+        output_channel = 32
         net, out = residual_block(data=net, kernel=(1, 2), dilate=(1, d), num_filter=32, stride=(1, 1), output_channel=output_channel, name=name)
         residual.append(net)
         outs.append(out)
         shape[name+"-zero"] = (batch_size, output_channel, 1, d)
-    net = outs[0]+outs[1]+outs[2]+outs[3]+outs[4]+outs[5]+outs[6]+outs[7]
+    # net = outs[0]+outs[1]+outs[2]+outs[3]+outs[4]+outs[5]+outs[6]+outs[7]
+    # net=sum(outs)
+    net = outs[0]
+    for out in outs[1:]:
+        net += out
     net = mx.symbol.Activation(data=net, act_type="relu", name="sum-activation")
     net = mx.symbol.Convolution(data=net, kernel=(1, 1), num_filter=128, name="post-conv1")
     net = mx.symbol.Activation(data=net, act_type="relu", name="post-activation1")
@@ -133,10 +156,11 @@ if __name__ == "__main__":
     for root, dirnames, filenames in os.walk(target):
         for filename in fnmatch.filter(filenames, "*.wav"):
             names.append(os.path.join(root, filename))
+    # names = names[:100]
     data = DataIter(batch_size=params['batch_size'], length=params['length'], names=names, shape=shape)
     opt = mx.optimizer.SGD(momentum=0.9, learning_rate=1e-3)
     init = mx.init.Xavier(rnd_type="gaussian", factor_type="in", magnitude=2)
-    model = mx.model.FeedForward(symbol=net, ctx=mx.gpu(), num_epoch=1, optimizer=opt, initializer=init)
-    mon = mx.monitor.Monitor(interval=1, stat_func=None, pattern=".*grad", sort=False)
+    model = mx.model.FeedForward(symbol=net, ctx=mx.gpu(0), num_epoch=10, optimizer=opt, initializer=init)
+    mon = mx.monitor.Monitor(interval=1, stat_func=None, pattern=".*softmax_output", sort=False)
     mon = None
-    model.fit(X=data, eval_metric="mae", monitor=mon, batch_end_callback=mx.callback.Speedometer(batch_size, 10))
+    model.fit(X=data, eval_metric=MYMAE(), monitor=mon, batch_end_callback=mx.callback.Speedometer(batch_size, 10))
