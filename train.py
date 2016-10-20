@@ -6,6 +6,7 @@ import os
 import fnmatch
 import multiprocessing
 import random
+import argparse
 from scipy.ndimage.interpolation import shift
 
 def causal_layer(data=None, name="causal"):
@@ -28,8 +29,8 @@ def residual_block(data=None, kernel=(1, 2), dilate=None, num_filter=32, name=No
     output_gate = mx.symbol.Activation(data=conv_gate, act_type="sigmoid", name=name+"act_gate")
     output = output_filter * output_gate
     out_dense = mx.symbol.Convolution(data=output, kernel=(1, 1), num_filter=output_channel, name=name+"out_dense")
-    out_skip = mx.symbol.Convolution(data=output, kernel=(1, 1), num_filter=output_channel, name=name+"out_skip")
-    return out_skip+data, out_dense
+    # out_skip = mx.symbol.Convolution(data=output, kernel=(1, 1), num_filter=output_channel, name=name+"out_skip")
+    return out_dense+data, out_dense
 
 class DataBatch(mx.io.DataBatch):
     def __init__(self, data, label):
@@ -118,11 +119,15 @@ class MYMAE(mx.metric.EvalMetric):
             self.num_inst += 1 # numpy.prod(label.shape)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="lalala")
+    parser.add_argument('--gpus', type=int, default=0)
+    parser.add_argument('--batch_size', type=int, default=1)
+    args=parser.parse_args()
     head = '%(asctime)-15s %(message)s'
     logging.basicConfig(level=logging.INFO, format=head)
     dilate = [2**i for i in range(1, 10)]
     shape = {}
-    params = {'length': 2**15, 'batch_size': 1}
+    params = {'length': 2**15, 'batch_size': args.batch_size}
     batch_size = params['batch_size']
     length = params['length']
     data = mx.symbol.Variable(name="input")
@@ -140,8 +145,6 @@ if __name__ == "__main__":
         residual.append(net)
         outs.append(out)
         shape[name+"-zero"] = (batch_size, output_channel, 1, d)
-    # net = outs[0]+outs[1]+outs[2]+outs[3]+outs[4]+outs[5]+outs[6]+outs[7]
-    # net=sum(outs)
     net = outs[0]
     for out in outs[1:]:
         net += out
@@ -150,7 +153,7 @@ if __name__ == "__main__":
     net = mx.symbol.Activation(data=net, act_type="relu", name="post-activation1")
     net = mx.symbol.Convolution(data=net, kernel=(1, 1), num_filter=256, name="post-conv2")
     net = mx.symbol.SoftmaxOutput(data=net, name="softmax", multi_output=True)
-    # mx.viz.plot_network(symbol=net, shape=shape, node_attrs={"fixedsize": "false"}).render(filename="tts", cleanup=True, view=True)
+    mx.viz.plot_network(symbol=net, shape=shape, node_attrs={"fixedsize": "false"}).render(filename="tts", cleanup=True, view=True)
     target = "./VCTK-Corpus/wav48/"
     names = []
     for root, dirnames, filenames in os.walk(target):
@@ -160,7 +163,7 @@ if __name__ == "__main__":
     data = DataIter(batch_size=params['batch_size'], length=params['length'], names=names, shape=shape)
     opt = mx.optimizer.SGD(momentum=0.9, learning_rate=1e-3)
     init = mx.init.Xavier(rnd_type="gaussian", factor_type="in", magnitude=2)
-    model = mx.model.FeedForward(symbol=net, ctx=mx.gpu(0), num_epoch=10, optimizer=opt, initializer=init)
+    model = mx.model.FeedForward(symbol=net, ctx=mx.gpu(args.gpus), num_epoch=100, optimizer=opt, initializer=init)
     mon = mx.monitor.Monitor(interval=1, stat_func=None, pattern=".*softmax_output", sort=False)
     mon = None
-    model.fit(X=data, eval_metric=MYMAE(), monitor=mon, batch_end_callback=mx.callback.Speedometer(batch_size, 10))
+    model.fit(X=data, eval_metric=MYMAE(), monitor=mon, batch_end_callback=mx.callback.Speedometer(batch_size, 10),epoch_end_callback=mx.callback.do_checkpoint("models/tts"))
